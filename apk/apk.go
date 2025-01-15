@@ -7,9 +7,11 @@ import (
 	"image"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/shogo82148/androidbinary"
 
+	_ "golang.org/x/image/webp"
 	_ "image/jpeg" // handle jpeg format
 	_ "image/png"  // handle png format
 )
@@ -81,6 +83,61 @@ func (k *Apk) Icon(resConfig *androidbinary.ResTableConfig) (image.Image, error)
 		return nil, newError("unable to convert icon-id to icon path")
 	}
 	imgData, err := k.readZipFile(iconPath)
+
+	type AdaptiveIcon struct {
+		Background struct {
+			Drawable string `xml:"http://schemas.android.com/apk/res/android drawable,attr"`
+		} `xml:"background"`
+		Foreground struct {
+			Drawable string `xml:"http://schemas.android.com/apk/res/android drawable,attr"`
+		} `xml:"foreground"`
+	}
+
+	// is it an android XML file (maybe an adaptive-icon)?
+	if strings.HasSuffix(iconPath, ".xml") {
+		// TODO: I absolutely do not like the below code but it worked for my sample application that used an adaptive icon; not sure if it would also work for others
+
+		// read the raw XML data from the android xml file
+		xmlfile, err := androidbinary.NewXMLFile(bytes.NewReader(imgData))
+		if err != nil {
+			return nil, errorf("failed to parse %q: %w", iconPath, err)
+		}
+		var adaptiveIcon AdaptiveIcon
+		if err = xmlfile.Decode(&adaptiveIcon, k.table, nil); err != nil {
+			return nil, errorf("failed to decode %q: %w", iconPath, err)
+		}
+
+		var innerForegroundImagePath string
+		if androidbinary.IsResID(adaptiveIcon.Background.Drawable) {
+			resID, err := androidbinary.ParseResID(adaptiveIcon.Foreground.Drawable)
+			if err != nil {
+				return nil, errorf("failed to parse resID %q: %w", adaptiveIcon.Foreground.Drawable, err)
+			}
+
+			innerForegroundImagePathTmp, err := k.table.GetResource(resID, nil)
+			switch v := innerForegroundImagePathTmp.(type) {
+			case string:
+				innerForegroundImagePath = v
+			default:
+				return nil, errorf("failed to get resource %q: %w", adaptiveIcon.Foreground.Drawable, err)
+			}
+
+			innerForegroundImagePath = innerForegroundImagePathTmp.(string)
+			if err != nil {
+				return nil, errorf("failed to get resource %q: %w", adaptiveIcon.Foreground.Drawable, err)
+			}
+		}
+
+		if innerForegroundImagePath == "" {
+			return nil, errorf("failed to find inner foreground in %q", iconPath)
+		}
+
+		// read from the inner foreground image location
+		imgData, err = k.readZipFile(innerForegroundImagePath)
+		if err != nil {
+			return nil, errorf("failed to read %q: %w", adaptiveIcon.Foreground, err)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -180,14 +237,18 @@ func (k *Apk) readZipFile(name string) (data []byte, err error) {
 		if file.Name != name {
 			continue
 		}
-		rc, er := file.Open()
-		if er != nil {
-			err = er
-			return
+		localFun := func() error {
+			rc, e := file.Open()
+			if e != nil {
+				return e
+			}
+			defer rc.Close()
+			if _, e = io.Copy(buf, rc); e != nil {
+				return e
+			}
+			return nil
 		}
-		defer rc.Close()
-		_, err = io.Copy(buf, rc)
-		if err != nil {
+		if err = localFun(); err != nil {
 			return
 		}
 		return buf.Bytes(), nil
